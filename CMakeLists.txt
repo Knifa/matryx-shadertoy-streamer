@@ -14,6 +14,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(argparse)
 
 pkg_check_modules(websockets REQUIRED libwebsockets)
+pkg_check_modules(png REQUIRED libpng)
 
 add_executable(matryx_shadertoy_streamer
   ./src/main.cpp
@@ -21,19 +22,22 @@ add_executable(matryx_shadertoy_streamer
 
 target_link_libraries(matryx_shadertoy_streamer PRIVATE
   ${argparse_LIBRARIES}
+  ${png_LIBRARIES}
   ${websockets_LIBRARIES}
   ${ZMQ_LIBRARIES}
 )
 
 target_include_directories(matryx_shadertoy_streamer PRIVATE
   ${argparse_INCLUDE_DIRS}
+  ${png_INCLUDE_DIRS}
   ${websockets_INCLUDE_DIRS}
   ${ZMQ_INCLUDE_DIRS}
 )
 
 target_compile_features(matryx_shadertoy_streamer PRIVATE cxx_std_20)
 target_compile_options(matryx_shadertoy_streamer PRIVATE
-  -O3
+  -fcolor-diagnostics
   -mtune=native
+  -O3
   -Wall
 )
