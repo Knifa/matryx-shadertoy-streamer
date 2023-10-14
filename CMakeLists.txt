@@ -23,6 +23,7 @@ add_executable(matryx_shadertoy_streamer
 target_link_libraries(matryx_shadertoy_streamer PRIVATE
   argparse::argparse
   JPEG::JPEG
+  pthread
   ${websockets_LIBRARIES}
   ${ZMQ_LIBRARIES}
 )

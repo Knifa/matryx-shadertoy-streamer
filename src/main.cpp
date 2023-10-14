@@ -119,7 +119,7 @@ void zmq_thread() {
   zmq::context_t context;
   zmq::socket_t socket(context, ZMQ_SUB);
   socket.connect(args->outputEndpoint);
-  socket.set(zmq::sockopt::subscribe, "output");
+  socket.setsockopt(ZMQ_SUBSCRIBE, "output", 6);
 
   std::chrono::time_point<std::chrono::steady_clock> nextFrameTime =
       std::chrono::steady_clock::now();
@@ -203,17 +203,18 @@ int main(int argc, char *argv[]) {
   args = new Args(argc, argv);
   args->print();
 
-  std::thread zmqThreadHandle(zmq_thread);
-
   struct lws_context_creation_info info;
   memset(&info, 0, sizeof(info));
 
-  info.port = 8080;
+  info.port = 42025;
   info.protocols = protocols;
   info.options |= LWS_SERVER_OPTION_LIBUV;
   info.signal_cb = signalCallback;
   lwsContext = lws_create_context(&info);
   signal(SIGINT, signalHandler);
+
+
+  std::thread zmqThreadHandle(zmq_thread);
 
   while (!lws_service(lwsContext, 0)) {
     // Do stuff.
