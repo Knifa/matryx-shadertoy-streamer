@@ -1,51 +1,106 @@
+#include <chrono>
 #include <iostream>
 #include <list>
 #include <memory>
 #include <mutex>
 #include <thread>
 
+#include <signal.h>
+
+#include <argparse/argparse.hpp>
+#include <jpeglib.h>
 #include <libwebsockets.h>
-#include <png.h>
 #include <zmq.hpp>
 #include <zmq_addon.hpp>
 
-std::list<struct lws *> clients;
+class Args {
+public:
+  int width;
+  int height;
+  std::string outputEndpoint;
+
+  Args(int argc, char *argv[]) {
+    argparse::ArgumentParser program("matryx_shadertoy_streamer");
+
+    program.add_argument("--width").default_value(192).scan<'i', int>();
+    program.add_argument("--height").default_value(320).scan<'i', int>();
+    program.add_argument("--output-endpoint")
+        .default_value(std::string("ipc:///var/run/matryx-shadertoy-output"));
+
+    try {
+      program.parse_args(argc, argv);
+    } catch (const std::runtime_error &err) {
+      std::cout << err.what() << std::endl;
+      std::cout << program;
+      throw;
+    }
+
+    width = program.get<int>("--width");
+    height = program.get<int>("--height");
+    outputEndpoint = program.get<std::string>("--output-endpoint");
+  }
+
+  void print() {
+    std::cout << "width: " << width << std::endl;
+    std::cout << "height: " << height << std::endl;
+    std::cout << "outputEndpoint: " << outputEndpoint << std::endl;
+  }
+};
+
+Args *args;
 
 std::mutex latestPixelsMutex;
 void *latestPixels = nullptr;
 int latestPixelsSize = 0;
+int latestPixelsIndex = 0;
+int stopping = 0;
 
-static int callback_matryx(struct lws *wsi, enum lws_callback_reasons reasons, void *user, void *in,
-                           size_t len) {
-  switch (reasons) {
+struct matryxPerSessionData {
+  unsigned char *pixels;
+  int lastSentIndex;
+};
+
+struct lws_context *lwsContext;
+
+static int matryxCallback(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in,
+                          size_t len) {
+  struct matryxPerSessionData *pss = (struct matryxPerSessionData *)user;
+
+  switch (reason) {
   case LWS_CALLBACK_ESTABLISHED:
     std::cout << "LWS_CALLBACK_ESTABLISHED" << std::endl;
-    clients.push_back(wsi);
+    pss->pixels = new unsigned char[LWS_PRE + args->width * args->height * 3];
     break;
 
   case LWS_CALLBACK_SERVER_WRITEABLE: {
     // std::cout << "LWS_CALLBACK_SERVER_WRITEABLE" << std::endl;
 
     latestPixelsMutex.lock();
+    if (pss->lastSentIndex == latestPixelsIndex) {
+      // std::cout << "Skipping LWS_CALLBACK_SERVER_WRITEABLE" << std::endl;
+      latestPixelsMutex.unlock();
+      break;
+    }
+
     int pixelsSize = latestPixelsSize;
-    int bufSize = LWS_PRE + pixelsSize;
-    unsigned char *buf = (unsigned char *)std::malloc(bufSize);
-    std::memcpy(buf + LWS_PRE, latestPixels, pixelsSize);
+    int pixelsIndex = latestPixelsIndex;
+    std::memcpy(pss->pixels + LWS_PRE, latestPixels, pixelsSize);
     latestPixelsMutex.unlock();
 
-    lws_write(wsi, buf + LWS_PRE, pixelsSize, LWS_WRITE_BINARY);
-    std::free(buf);
+    int result = lws_write(wsi, pss->pixels + LWS_PRE, pixelsSize, LWS_WRITE_BINARY);
+    if (result < 0) {
+      std::cout << "lws_write failed" << std::endl;
+    }
 
+    pss->lastSentIndex = pixelsIndex;
+
+    // std::cout << "lws_write result: " << result << std::endl;
     break;
   }
 
-  case LWS_CALLBACK_RECEIVE:
-    std::cout << "LWS_CALLBACK_RECEIVE" << std::endl;
-    break;
-
   case LWS_CALLBACK_CLOSED:
     std::cout << "LWS_CALLBACK_CLOSED" << std::endl;
-    clients.remove(wsi);
+    delete[] pss->pixels;
     break;
 
   default:
@@ -56,73 +111,98 @@ static int callback_matryx(struct lws *wsi, enum lws_callback_reasons reasons, v
 }
 
 const struct lws_protocols protocols[] = {
-    {"matryx", callback_matryx, 0, 0},
+    {"matryx", matryxCallback, sizeof(struct matryxPerSessionData), 0},
     {NULL, NULL, 0, 0},
 };
-
-void yeet_thread() {
-  while (true) {
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-
-    for (auto client : clients) {
-      lws_callback_on_writable(client);
-    }
-  }
-}
 
 void zmq_thread() {
   zmq::context_t context;
   zmq::socket_t socket(context, ZMQ_SUB);
+  socket.connect(args->outputEndpoint);
+  socket.set(zmq::sockopt::subscribe, "output");
 
-  png_image image;
-  memset(&image, 0, sizeof(image));
+  std::chrono::time_point<std::chrono::steady_clock> nextFrameTime =
+      std::chrono::steady_clock::now();
 
-  image.version = PNG_IMAGE_VERSION;
-  image.width = 192;
-  image.height = 320;
-  image.format = PNG_FORMAT_RGBA;
-  image.flags = PNG_IMAGE_FLAG_FAST;
-
-  socket.connect("tcp://127.0.0.1:42025");
-  socket.set(zmq::sockopt::subscribe, "layers");
-
-  while (true) {
+  while (!stopping) {
     zmq::multipart_t message;
     message.recv(socket);
 
-    // Pop topic.
-    message.pop();
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= nextFrameTime) {
+      nextFrameTime = now + std::chrono::milliseconds(1000 / 30);
+    } else {
+      continue;
+    }
 
-    const auto count = message.poptyp<int>();
+    message.pop();
 
     const auto pixelMessage = message.pop();
     const unsigned char *pixels = pixelMessage.data<unsigned char>();
 
-    void *pngPixels = std::malloc(PNG_IMAGE_DATA_SIZE(image));
+    struct jpeg_compress_struct cinfo;
+    struct jpeg_error_mgr jerr;
 
-    png_alloc_size_t pngPixelsSize = PNG_IMAGE_DATA_SIZE(image);
-    png_image_write_to_memory(&image, pngPixels, &pngPixelsSize, 0,
-                              pixels + (192 * 320 * 4 * (count - 1)), 0, nullptr);
+    cinfo.err = jpeg_std_error(&jerr);
+    jpeg_create_compress(&cinfo);
+
+    unsigned char *jpegOut = nullptr;
+    unsigned long jpegOutSize = 0;
+    jpeg_mem_dest(&cinfo, &jpegOut, &jpegOutSize);
+
+    cinfo.image_width = args->width;
+    cinfo.image_height = args->height;
+    cinfo.input_components = 4;
+    cinfo.in_color_space = JCS_EXT_RGBA;
+    jpeg_set_defaults(&cinfo);
+
+    cinfo.optimize_coding = false;
+    cinfo.dct_method = JDCT_IFAST;
+    for (int i = 0; i < cinfo.num_components; i++) {
+      cinfo.comp_info[i].h_samp_factor = 1;
+      cinfo.comp_info[i].v_samp_factor = 1;
+    }
+
+    jpeg_set_quality(&cinfo, 80, true);
+    jpeg_start_compress(&cinfo, false);
+
+    JSAMPROW row_pointer[args->height];
+    for (int i = 0; i < args->height; i++) {
+      row_pointer[i] = (JSAMPROW)&pixels[i * args->width * 4];
+    }
+
+    jpeg_write_scanlines(&cinfo, row_pointer, args->height);
+    jpeg_finish_compress(&cinfo);
+    jpeg_destroy_compress(&cinfo);
 
     latestPixelsMutex.lock();
     if (latestPixels != nullptr) {
       std::free(latestPixels);
     }
 
-    latestPixels = pngPixels;
-    latestPixelsSize = pngPixelsSize;
+    latestPixels = jpegOut;
+    latestPixelsSize = jpegOutSize;
+    latestPixelsIndex += 1;
     latestPixelsMutex.unlock();
 
-    for (auto client : clients) {
-      lws_callback_on_writable(client);
-    }
+    lws_callback_on_writable_all_protocol(lwsContext, &protocols[0]);
+    lws_cancel_service(lwsContext);
   }
+
+  std::cout << "zmq_thread exiting" << std::endl;
 }
 
-int main(int argc, char *argv[]) {
-  // lws_set_log_level(LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE | LLL_INFO, nullptr);
+void signalCallback(void *handle, int signum) {
+  stopping = 1;
+  lws_context_destroy(lwsContext);
+}
 
-  std::thread yeetThreadHandle(yeet_thread);
+void signalHandler(int sig) { signalCallback(nullptr, sig); }
+
+int main(int argc, char *argv[]) {
+  args = new Args(argc, argv);
+  args->print();
+
   std::thread zmqThreadHandle(zmq_thread);
 
   struct lws_context_creation_info info;
@@ -130,22 +210,18 @@ int main(int argc, char *argv[]) {
 
   info.port = 8080;
   info.protocols = protocols;
+  info.options |= LWS_SERVER_OPTION_LIBUV;
+  info.signal_cb = signalCallback;
+  lwsContext = lws_create_context(&info);
+  signal(SIGINT, signalHandler);
 
-  struct lws_context *context = lws_create_context(&info);
-  if (context == NULL) {
-    std::cout << "Failed to create libwebsocket context" << std::endl;
-    return -1;
+  while (!lws_service(lwsContext, 0)) {
+    // Do stuff.
   }
 
-  int n = 0;
-  while (n >= 0) {
-    n = lws_service(context, 0);
-  }
-
-  lws_context_destroy(context);
-
-  yeetThreadHandle.join();
+  lws_context_destroy(lwsContext);
   zmqThreadHandle.join();
+  delete args;
 
   return 0;
 }

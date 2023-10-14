@@ -1,9 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-
 project(matryx_shadertoy_streamer)
-
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(ZMQ REQUIRED libzmq)
 
 include(FetchContent)
 FetchContent_Declare(
@@ -13,23 +9,27 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(argparse)
 
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(ZMQ REQUIRED libzmq)
 pkg_check_modules(websockets REQUIRED libwebsockets)
-pkg_check_modules(png REQUIRED libpng)
+pkg_check_modules(uv REQUIRED libuv)
+
+find_package(JPEG REQUIRED)
 
 add_executable(matryx_shadertoy_streamer
   ./src/main.cpp
 )
 
 target_link_libraries(matryx_shadertoy_streamer PRIVATE
-  ${argparse_LIBRARIES}
-  ${png_LIBRARIES}
+  argparse::argparse
+  JPEG::JPEG
   ${websockets_LIBRARIES}
   ${ZMQ_LIBRARIES}
 )
 
 target_include_directories(matryx_shadertoy_streamer PRIVATE
-  ${argparse_INCLUDE_DIRS}
-  ${png_INCLUDE_DIRS}
+  argparse::argparse
+  JPEG::JPEG
   ${websockets_INCLUDE_DIRS}
   ${ZMQ_INCLUDE_DIRS}
 )
