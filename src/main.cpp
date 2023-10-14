@@ -51,13 +51,14 @@ Args *args;
 
 std::mutex latestPixelsMutex;
 void *latestPixels = nullptr;
-int latestPixelsSize = 0;
-int latestPixelsIndex = 0;
-int stopping = 0;
+unsigned int latestPixelsSize = 0;
+unsigned int latestPixelsIndex = 0;
+unsigned int stopping = 0;
 
 struct matryxPerSessionData {
   unsigned char *pixels;
-  int lastSentIndex;
+  unsigned int pixelsSize;
+  unsigned int lastSentIndex;
 };
 
 struct matryxSharedData {
@@ -75,7 +76,9 @@ static int matryxCallback(struct lws *wsi, enum lws_callback_reasons reason, voi
   switch (reason) {
   case LWS_CALLBACK_ESTABLISHED:
     std::cout << "LWS_CALLBACK_ESTABLISHED" << std::endl;
-    pss->pixels = new unsigned char[LWS_PRE + args->width * args->height * 3];
+
+    pss->pixelsSize = (((LWS_PRE + args->width * args->height) / 32) + 1) * 32;
+    pss->pixels = new unsigned char[pss->pixelsSize];
 
     matryxSharedData.mutex.lock();
     matryxSharedData.activeConnections += 1;
@@ -88,24 +91,27 @@ static int matryxCallback(struct lws *wsi, enum lws_callback_reasons reason, voi
 
     latestPixelsMutex.lock();
     if (pss->lastSentIndex == latestPixelsIndex) {
-      // std::cout << "Skipping LWS_CALLBACK_SERVER_WRITEABLE" << std::endl;
       latestPixelsMutex.unlock();
       break;
     }
 
     int pixelsSize = latestPixelsSize;
-    int pixelsIndex = latestPixelsIndex;
+    pss->lastSentIndex = latestPixelsIndex;
+
+    if (pixelsSize > pss->pixelsSize) {
+      std::cerr << "pixelsSize > pss->pixelsSize" << std::endl;
+      latestPixelsMutex.unlock();
+      break;
+    }
+
     std::memcpy(pss->pixels + LWS_PRE, latestPixels, pixelsSize);
     latestPixelsMutex.unlock();
 
     int result = lws_write(wsi, pss->pixels + LWS_PRE, pixelsSize, LWS_WRITE_BINARY);
     if (result < 0) {
-      std::cout << "lws_write failed" << std::endl;
+      std::cerr << "lws_write failed" << std::endl;
     }
 
-    pss->lastSentIndex = pixelsIndex;
-
-    // std::cout << "lws_write result: " << result << std::endl;
     break;
   }
 
@@ -146,19 +152,19 @@ void zmq_thread() {
     zmq::multipart_t message;
     message.recv(socket);
 
-    matryxSharedData.mutex.lock();
-    if (matryxSharedData.activeConnections == 0) {
-      matryxSharedData.mutex.unlock();
-      continue;
-    }
-    matryxSharedData.mutex.unlock();
-
     const auto now = std::chrono::steady_clock::now();
     if (now >= nextFrameTime) {
       nextFrameTime = now + std::chrono::milliseconds(1000 / 30);
     } else {
       continue;
     }
+
+    matryxSharedData.mutex.lock();
+    if (matryxSharedData.activeConnections == 0) {
+      matryxSharedData.mutex.unlock();
+      continue;
+    }
+    matryxSharedData.mutex.unlock();
 
     message.pop();
 
@@ -181,7 +187,6 @@ void zmq_thread() {
     cinfo.in_color_space = JCS_EXT_RGBA;
     jpeg_set_defaults(&cinfo);
 
-    cinfo.optimize_coding = false;
     cinfo.dct_method = JDCT_IFAST;
     for (int i = 0; i < cinfo.num_components; i++) {
       cinfo.comp_info[i].h_samp_factor = 1;
@@ -217,13 +222,6 @@ void zmq_thread() {
   std::cout << "zmq_thread exiting" << std::endl;
 }
 
-void signalCallback(void *handle, int signum) {
-  stopping = 1;
-  lws_context_destroy(lwsContext);
-}
-
-void signalHandler(int sig) { signalCallback(nullptr, sig); }
-
 int main(int argc, char *argv[]) {
   args = new Args(argc, argv);
   args->print();
@@ -233,21 +231,20 @@ int main(int argc, char *argv[]) {
 
   info.port = 42025;
   info.protocols = protocols;
-  info.options |= LWS_SERVER_OPTION_LIBUV;
-  info.signal_cb = signalCallback;
+  info.pcontext = &lwsContext;
   lwsContext = lws_create_context(&info);
-  signal(SIGINT, signalHandler);
 
   std::thread zmqThreadHandle(zmq_thread);
 
   std::cout << "Starting LWS" << std::endl;
   while (!lws_service(lwsContext, 0)) {
-    // Do stuff.
+    // Doin' it.
   }
 
-  lws_context_destroy(lwsContext);
+  stopping = 1;
   zmqThreadHandle.join();
-  delete args;
+
+  lws_context_destroy(lwsContext);
 
   return 0;
 }
