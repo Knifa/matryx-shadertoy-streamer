@@ -60,7 +60,13 @@ struct matryxPerSessionData {
   int lastSentIndex;
 };
 
+struct matryxSharedData {
+  std::mutex mutex;
+  unsigned int activeConnections;
+};
+
 struct lws_context *lwsContext;
+struct matryxSharedData matryxSharedData;
 
 static int matryxCallback(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in,
                           size_t len) {
@@ -70,6 +76,11 @@ static int matryxCallback(struct lws *wsi, enum lws_callback_reasons reason, voi
   case LWS_CALLBACK_ESTABLISHED:
     std::cout << "LWS_CALLBACK_ESTABLISHED" << std::endl;
     pss->pixels = new unsigned char[LWS_PRE + args->width * args->height * 3];
+
+    matryxSharedData.mutex.lock();
+    matryxSharedData.activeConnections += 1;
+    matryxSharedData.mutex.unlock();
+
     break;
 
   case LWS_CALLBACK_SERVER_WRITEABLE: {
@@ -101,6 +112,11 @@ static int matryxCallback(struct lws *wsi, enum lws_callback_reasons reason, voi
   case LWS_CALLBACK_CLOSED:
     std::cout << "LWS_CALLBACK_CLOSED" << std::endl;
     delete[] pss->pixels;
+
+    matryxSharedData.mutex.lock();
+    matryxSharedData.activeConnections -= 1;
+    matryxSharedData.mutex.unlock();
+
     break;
 
   default:
@@ -116,6 +132,8 @@ const struct lws_protocols protocols[] = {
 };
 
 void zmq_thread() {
+  std::cout << "Starting ZMQ thread" << std::endl;
+
   zmq::context_t context;
   zmq::socket_t socket(context, ZMQ_SUB);
   socket.connect(args->outputEndpoint);
@@ -127,6 +145,13 @@ void zmq_thread() {
   while (!stopping) {
     zmq::multipart_t message;
     message.recv(socket);
+
+    matryxSharedData.mutex.lock();
+    if (matryxSharedData.activeConnections == 0) {
+      matryxSharedData.mutex.unlock();
+      continue;
+    }
+    matryxSharedData.mutex.unlock();
 
     const auto now = std::chrono::steady_clock::now();
     if (now >= nextFrameTime) {
@@ -213,9 +238,9 @@ int main(int argc, char *argv[]) {
   lwsContext = lws_create_context(&info);
   signal(SIGINT, signalHandler);
 
-
   std::thread zmqThreadHandle(zmq_thread);
 
+  std::cout << "Starting LWS" << std::endl;
   while (!lws_service(lwsContext, 0)) {
     // Do stuff.
   }
