@@ -77,7 +77,8 @@ static int matryxCallback(struct lws *wsi, enum lws_callback_reasons reason, voi
   case LWS_CALLBACK_ESTABLISHED:
     std::cout << "LWS_CALLBACK_ESTABLISHED" << std::endl;
 
-    pss->pixelsSize = (((LWS_PRE + args->width * args->height) / 32) + 1) * 32;
+    pss->pixelsSize = (args->width * args->height * 3); // Roughly.
+    pss->pixelsSize = LWS_PRE + pss->pixelsSize;
     pss->pixels = new unsigned char[pss->pixelsSize];
 
     matryxSharedData.mutex.lock();
@@ -193,7 +194,7 @@ void zmq_thread() {
       cinfo.comp_info[i].v_samp_factor = 1;
     }
 
-    jpeg_set_quality(&cinfo, 80, true);
+    jpeg_set_quality(&cinfo, 95, true);
     jpeg_start_compress(&cinfo, false);
 
     JSAMPROW row_pointer[args->height];
@@ -226,13 +227,23 @@ int main(int argc, char *argv[]) {
   args = new Args(argc, argv);
   args->print();
 
+  lws_set_log_level(LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE, nullptr);
+
   struct lws_context_creation_info info;
   memset(&info, 0, sizeof(info));
 
+  const lws_retry_bo_t retry = {
+      .secs_since_valid_ping = 3,
+      .secs_since_valid_hangup = 10,
+  };
+
+  info.options = LWS_SERVER_OPTION_HTTP_HEADERS_SECURITY_BEST_PRACTICES_ENFORCE;
+  info.pcontext = &lwsContext;
   info.port = 42025;
   info.protocols = protocols;
-  info.pcontext = &lwsContext;
-  lwsContext = lws_create_context(&info);
+  info.retry_and_idle_policy = &retry;
+  info.vhost_name = "localhost";
+  info.ws_ping_pong_interval = 10, lwsContext = lws_create_context(&info);
 
   std::thread zmqThreadHandle(zmq_thread);
 
