@@ -25,7 +25,7 @@ public:
     program.add_argument("--width").default_value(192).scan<'i', int>();
     program.add_argument("--height").default_value(320).scan<'i', int>();
     program.add_argument("--output-endpoint")
-        .default_value(std::string("ipc:///var/run/matryx-shadertoy-output"));
+        .default_value(std::string("ipc:///tmp/matryx-shadertoy-output.sock"));
 
     try {
       program.parse_args(argc, argv);
